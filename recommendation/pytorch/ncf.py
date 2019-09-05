@@ -71,27 +71,33 @@ def parse_args():
     return parser.parse_args()
 
 
-# TODO: val_epoch is not currently supported on cpu
 def val_epoch(model, x, y, dup_mask, real_indices, K, samples_per_user, num_user, output=None,
-              epoch=None, loss=None):
+              epoch=None, loss=None, use_cuda=True):
+
+    device = 'cuda' if use_cuda else 'cpu'
 
     start = datetime.now()
     log_2 = math.log(2)
 
     model.eval()
-    hits = torch.tensor(0., device='cuda')
-    ndcg = torch.tensor(0., device='cuda')
+    hits = torch.tensor(0., device=device)
+    ndcg = torch.tensor(0., device=device)
 
     with torch.no_grad():
         for i, (u,n) in enumerate(zip(x,y)):
-            res = model(u.cuda().view(-1), n.cuda().view(-1), sigmoid=True).detach().view(-1,samples_per_user)
+            if use_cuda:
+                u, n = u.cuda(), n.cuda()
+            res = model(u.view(-1), n.view(-1), sigmoid=True).detach().view(-1,samples_per_user)
             # set duplicate results for the same item to -1 before topk
-            res[dup_mask[i]] = -1
+            # convert dup_mask to bool to skip the following warning on pytorch 1.2+
+            #   UserWarning: indexing with dtype torch.uint8 is now deprecated, please use a dtype torch.bool instead
+            res[dup_mask[i].bool()] = -1
             out = torch.topk(res,K)[1]
             # topk in pytorch is stable(if not sort)
             # key(item):value(predicetion) pairs are ordered as original key(item) order
             # so we need the first position of real item(stored in real_indices) to check if it is in topk
-            ifzero = (out == real_indices[i].cuda().view(-1,1))
+            real_indice = real_indices[i].cuda() if use_cuda else real_indices[i]
+            ifzero = (out == real_indice.view(-1,1))
             hits += ifzero.sum()
             ndcg += (log_2 / (torch.nonzero(ifzero)[:,1].view(-1).to(torch.float)+2).log_()).sum()
 
@@ -152,7 +158,8 @@ def main():
     mlperf_log.ncf_print(key=mlperf_log.INPUT_STEP_EVAL_NEG_GEN)
 
     # sync worker before timing.
-    torch.cuda.synchronize()
+    if use_cuda:
+        torch.cuda.synchronize()
 
     #===========================================================================
     #== The clock starts on loading the preprocessed data. =====================
@@ -223,12 +230,12 @@ def main():
             for a, b in zip(indices, indices_order)] #[0,1,3,2]
     # produce -1 mask
     dup_mask = [(l[:,0:-1] == l[:,1:]) for l in sorted_items]
-    dup_mask = [torch.cat((torch.zeros_like(a, dtype=torch.uint8), b),dim=1)
+    dup_mask = [torch.cat((torch.zeros_like(a, dtype=torch.uint8), b.type(torch.uint8)),dim=1)
             for a, b in zip(test_pos, dup_mask)]
     dup_mask = [torch.gather(a,1,b.sort()[1])
             for a, b in zip(dup_mask, stable_indices)]
     # produce real sample indices to later check in topk
-    sorted_items, indices = zip(*[(a != b).sort()
+    sorted_items, indices = zip(*[(a != b).type(torch.uint8).sort()
             for a, b in zip(test_items, test_pos)])
     sum_item_indices = [(a.float()) + (b.float())/len(b[0])
             for a, b in zip(sorted_items, indices)]
@@ -250,7 +257,8 @@ def main():
     real_indices = torch.cat(real_indices)
 
     # make pytorch memory behavior more consistent later
-    torch.cuda.empty_cache()
+    if use_cuda:
+        torch.cuda.empty_cache()
 
     mlperf_log.ncf_print(key=mlperf_log.INPUT_BATCH_SIZE, value=args.batch_size)
     mlperf_log.ncf_print(key=mlperf_log.INPUT_ORDER)  # we shuffled later with randperm
@@ -304,7 +312,7 @@ def main():
     real_indices = real_indices.split(users_per_valid_batch)
 
     hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user,
-                         num_user=nb_users)
+                         num_user=nb_users, use_cuda=use_cuda)
     print('Initial HR@{K} = {hit_rate:.4f}, NDCG@{K} = {ndcg:.4f}'
           .format(K=args.topk, hit_rate=hr, ndcg=ndcg))
     success = False
@@ -319,7 +327,7 @@ def main():
         st = timeit.default_timer()
         if args.random_negatives:
             neg_users = train_users.repeat(args.negative_samples)
-            neg_items = torch.empty_like(neg_users, dtype=torch.int64).random_(0, nb_items)
+            neg_items = torch.empty_like(neg_users, dtype=torch.int64).random_(0, int(nb_items))
         else:
             negatives = generate_negatives(
                 sampler,
@@ -329,7 +337,7 @@ def main():
             neg_users = negatives[:, 0]
             neg_items = negatives[:, 1]
 
-        print("generate_negatives loop time: {:.2f}", timeit.default_timer() - st)
+        print("generate_negatives loop time: {:.2f}".format(timeit.default_timer() - st))
 
         after_neg_gen = time.time()
 
@@ -348,7 +356,7 @@ def main():
         epoch_items_list = epoch_items.split(local_batch)
         epoch_label_list = epoch_label.split(local_batch)
 
-        print("shuffle time: {:.2f}", timeit.default_timer() - st)
+        print("shuffle time: {:.2f}".format(timeit.default_timer() - st))
 
         # only print progress bar on rank 0
         num_batches = (epoch_size + args.batch_size - 1) // args.batch_size
@@ -365,9 +373,11 @@ def main():
 
         for i in qbar:
             # selecting input from prepared data
-            user = epoch_users_list[i].cuda()
-            item = epoch_items_list[i].cuda()
-            label = epoch_label_list[i].view(-1,1).cuda()
+            user = epoch_users_list[i]
+            item = epoch_items_list[i]
+            label = epoch_label_list[i].view(-1,1)
+            if use_cuda:
+                user, item, label = user.cuda(), item.cuda(), label.cuda()
 
             for p in model.parameters():
                 p.grad = None
