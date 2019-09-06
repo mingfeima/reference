@@ -396,7 +396,7 @@ def main():
         mlperf_log.ncf_print(key=mlperf_log.EVAL_START, value=epoch)
 
         hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user,
-                             num_user=nb_users, output=valid_results_file, epoch=epoch, loss=loss.data.item())
+                             num_user=nb_users, output=valid_results_file, epoch=epoch, loss=loss.data.item(), use_cuda=use_cuda)
 
         val_time = time.time() - begin
         print('Epoch {epoch}: HR@{K} = {hit_rate:.4f}, NDCG@{K} = {ndcg:.4f},'
