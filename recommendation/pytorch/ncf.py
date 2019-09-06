@@ -360,7 +360,8 @@ def main():
 
         # only print progress bar on rank 0
         num_batches = (epoch_size + args.batch_size - 1) // args.batch_size
-        qbar = tqdm.tqdm(range(num_batches))
+        # record only 1000 iterations
+        qbar = tqdm.tqdm(range(1000))
         # handle extremely rare case where last batch size < number of worker
         if len(epoch_users_list) < num_batches:
             print("epoch_size % batch_size < number of worker!")
@@ -371,8 +372,10 @@ def main():
         neg_gen_time = (after_neg_gen - begin)
         shuffle_time = (after_shuffle - after_neg_gen)
 
+        t01, t12, t23, t34, t45 = 0, 0, 0, 0, 0
         for i in qbar:
             # selecting input from prepared data
+            t0 = time.time()
             user = epoch_users_list[i]
             item = epoch_items_list[i]
             label = epoch_label_list[i].view(-1,1)
@@ -382,12 +385,29 @@ def main():
             for p in model.parameters():
                 p.grad = None
 
+            t1 = time.time()
             outputs = model(user, item)
+            t2 = time.time()
             loss = traced_criterion(outputs, label).float()
             loss = torch.mean(loss.view(-1), 0)
+            t3 = time.time()
 
             loss.backward()
+            t4 = time.time()
             optimizer.step()
+            t5 = time.time()
+
+            t01 += t1 - t0
+            t12 += t2 - t1
+            t23 += t3 - t2
+            t34 += t4 - t3
+            t45 += t5 - t4
+
+        print('# data loading: ', t01)
+        print('# forward:      ', t12)
+        print('# loss:         ', t23)
+        print('# backward:     ', t34)
+        print('# optimizer:    ', t45)
        
         del epoch_users, epoch_items, epoch_label, epoch_users_list, epoch_items_list, epoch_label_list, user, item, label
         train_time = time.time() - begin
@@ -396,7 +416,7 @@ def main():
         mlperf_log.ncf_print(key=mlperf_log.EVAL_START, value=epoch)
 
         hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user,
-                             num_user=nb_users, output=valid_results_file, epoch=epoch, loss=loss.data.item())
+                             num_user=nb_users, output=valid_results_file, epoch=epoch, loss=loss.data.item(), use_cuda=use_cuda)
 
         val_time = time.time() - begin
         print('Epoch {epoch}: HR@{K} = {hit_rate:.4f}, NDCG@{K} = {ndcg:.4f},'
